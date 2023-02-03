@@ -18,10 +18,7 @@ module.exports = {
   },
   plugins: [
     new WasmPackPlugin({
-      crateDirectory: path.resolve(
-        __dirname,
-        "./vendor/magic-wormhole.rs/wasm"
-      ),
+      crateDirectory: path.resolve(__dirname, "./wasm"),
       outDir: path.resolve(__dirname, "./pkg"),
     }),
     // Have this example work in Edge which doesn't ship `TextEncoder` or
