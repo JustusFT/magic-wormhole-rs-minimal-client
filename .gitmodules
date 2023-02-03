@@ -1,3 +1,0 @@
-[submodule "vendor/magic-wormhole.rs"]
-	path = vendor/magic-wormhole.rs
-	url = https://github.com/JustusFT/magic-wormhole.rs
