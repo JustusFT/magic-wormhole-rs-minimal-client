@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { ClientConfig } from "../../pkg";
+import streamSaver from "streamsaver";
 
 type Props = {};
 
@@ -57,8 +58,11 @@ export default function App({}: Props) {
         />
         <button
           onClick={async () => {
-            const result = await client.receive(code);
+            const fileStream = streamSaver.createWriteStream("filename.txt");
+            const writer = fileStream.getWriter();
+            const result = await client.receive(code, writer);
             console.log(result);
+            writer.close();
           }}
         >
           Submit

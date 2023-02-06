@@ -1,5 +1,5 @@
 use futures::io::{AsyncRead, Error};
-use futures::FutureExt;
+use futures::AsyncWrite;
 use std::borrow::Cow;
 use std::future::Future;
 use std::panic;
@@ -32,7 +32,7 @@ struct NoOpFuture {}
 impl Future for NoOpFuture {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Pending
     }
 }
@@ -109,33 +109,35 @@ impl ClientConfig {
                                     Ok(_) => {
                                         console_log!("Data sent");
                                         Ok(0.into())
-                                    },
+                                    }
                                     Err(e) => {
                                         console_log!("Error in data transfer: {:?}", e);
                                         Err(1.into())
-                                    },
+                                    }
                                 }
-                            },
+                            }
                             Err(_) => {
                                 console_log!("Error waiting for connection");
                                 Err(1.into())
-                            },
+                            }
                         }
-                    },
+                    }
                     Err(_) => {
                         console_log!("Error waiting for connection");
                         Err(1.into())
-                    },
+                    }
                 }
-            },
+            }
             Err(_) => {
                 console_log!("Error reading file");
                 Err(1.into())
-            },
+            }
         }
     }
 
-    pub async fn receive(&self, code: String) -> Option<JsValue> {
+    pub async fn receive(&self, code: String, writer: JsValue) -> Option<JsValue> {
+        let mut file_writer = FileWriter::new(writer);
+
         let rendezvous = Box::new(self.rendezvous_url.as_str());
         let connect = Wormhole::connect_with_code(
             transfer::APP_CONFIG.rendezvous_url(Cow::Owned(rendezvous.to_string())),
@@ -156,13 +158,12 @@ impl ClientConfig {
                 )
                 .await;
 
-                let mut file: Vec<u8> = Vec::new();
-
                 match req {
                     Ok(Some(req)) => {
                         let filename = req.filename.clone();
                         let filesize = req.filesize;
                         console_log!("File name: {:?}, size: {}", filename, filesize);
+
                         let file_accept = req.accept(
                             |info| {
                                 console_log!("Connected to '{:?}'", info);
@@ -170,62 +171,110 @@ impl ClientConfig {
                             |cur, total| {
                                 console_log!("Progress: {}/{}", cur, total);
                             },
-                            &mut file,
+                            &mut file_writer,
                             NoOpFuture {},
                         );
 
                         match file_accept.await {
                             Ok(_) => {
-                                console_log!("Data received, length: {}", file.len());
-                                let result = ReceiveResult {
-                                    data: file,
-                                    filename: filename.to_str().unwrap_or_default().into(),
-                                    filesize,
-                                };
-                                return Some(serde_wasm_bindgen::to_value(&result).unwrap());
-                            },
+                                console_log!("Data received");
+                                None
+                            }
                             Err(e) => {
                                 console_log!("Error in data transfer: {:?}", e);
                                 None
-                            },
+                            }
                         }
-                    },
+                    }
                     _ => {
                         console_log!("No ReceiveRequest");
                         None
-                    },
+                    }
                 }
-            },
+            }
             Err(_) => {
                 console_log!("Error in connection");
                 None
-            },
+            }
         };
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ReceiveResult {
-    data: Vec<u8>,
-    filename: String,
-    filesize: u64,
+struct FileWriter {
+    writer: JsValue,
+    f: Box<Option<JsFuture>>,
+}
+
+impl FileWriter {
+    fn new(writer: JsValue) -> Self {
+        FileWriter {
+            writer,
+            f: Box::new(None),
+        }
+    }
+}
+
+impl AsyncWrite for FileWriter {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // closing should be handled on the client side
+        Poll::Ready(Ok(()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // we don't buffer any data
+        Poll::Ready(Ok(()))
+    }
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let write = js_sys::Reflect::get(&self.writer, &"write".into()).unwrap();
+        if !write.is_function() {
+            panic!("writer.write is not a function")
+        }
+        let write_fn = js_sys::Function::from(write);
+        if let Some(f) = &mut *self.f {
+            let p = Pin::new(&mut *f);
+            match p.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    self.f = Box::new(None);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        } else {
+            let abuf = js_sys::ArrayBuffer::new(buf.len() as u32);
+            let uarr = js_sys::Uint8Array::new(&abuf);
+            uarr.copy_from(buf);
+            let write_call = write_fn.call1(&JsValue::UNDEFINED, &uarr.into());
+            let returned_promise: js_sys::Promise = write_call.unwrap().into();
+            let mut returned_future: JsFuture = returned_promise.into();
+            let p = Pin::new(&mut returned_future);
+            match p.poll(cx) {
+                _ => {
+                    self.f = Box::new(Some(returned_future));
+                    Poll::Pending
+                }
+            }
+        }
+    }
 }
 
 struct FileWrapper {
     file: web_sys::File,
     size: i32,
     index: i32,
-    future: Option<JsFuture>,
+    f: Box<Option<JsFuture>>,
 }
 
 impl FileWrapper {
     fn new(file: web_sys::File) -> Self {
         let size = file.size();
         FileWrapper {
-            file: file,
+            file,
             size: size as i32,
             index: 0,
-            future: None,
+            f: Box::new(None),
         }
     }
 }
@@ -238,25 +287,33 @@ impl AsyncRead for FileWrapper {
     ) -> Poll<Result<usize, Error>> {
         let start = self.index;
         let end = i32::min(start + buf.len() as i32, self.size);
-        let size = end - start;
 
-        let blob = self.file.slice_with_i32_and_i32(start, end).unwrap();
-
-        match &mut self.future {
-            Some(x) => match x.poll_unpin(cx) {
-                Poll::Ready(x) => {
-                    js_sys::Uint8Array::new(&x.unwrap()).copy_to(buf);
-                    self.index += size;
-                    self.future = Some(blob.array_buffer().into());
-
-                    Poll::Ready(Ok(size as usize))
-                },
+        if let Some(f) = &mut *self.f {
+            let p = Pin::new(&mut *f);
+            match p.poll(cx) {
                 Poll::Pending => Poll::Pending,
-            },
-            None => {
-                self.future = Some(blob.array_buffer().into());
-                Poll::Pending
-            },
+                Poll::Ready(array_buffer) => {
+                    let abuf: js_sys::ArrayBuffer = array_buffer.unwrap().into();
+                    unsafe {
+                        js_sys::Uint8Array::new(&abuf).raw_copy_to_ptr(buf.as_mut_ptr());
+                    }
+                    self.f = Box::new(None);
+                    let size = end - start;
+                    self.index += size;
+                    Poll::Ready(Ok(size as usize))
+                }
+            }
+        } else {
+            let blob = self.file.slice_with_i32_and_i32(start, end).unwrap();
+
+            let mut array_buffer_future: JsFuture = blob.array_buffer().into();
+            let p = Pin::new(&mut array_buffer_future);
+            match p.poll(cx) {
+                _ => {
+                    self.f = Box::new(Some(array_buffer_future));
+                    Poll::Pending
+                }
+            }
         }
     }
 }
